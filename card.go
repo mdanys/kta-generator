@@ -32,11 +32,11 @@ const (
 	radius = 32.0
 
 	// Layout constants
-	marginL  = 64.0  // left margin for all body content
-	marginR  = 64.0  // right margin
-	headerH  = 220.0 // total header height (navy + red strip)
-	redStripH = 78.0  // height of the red portion of header
-	qrSize   = 175.0 // QR code pixel size
+	marginL   = 64.0  // left margin for all body content
+	marginR   = 64.0  // right margin
+	headerH   = 220.0 // total header height (navy + red strip)
+	redStripH = 110.0  // height of the red portion of header
+	qrSize    = 175.0 // QR code pixel size
 )
 
 // Brand colours
@@ -66,12 +66,12 @@ func GenerateKTACard(data KTAData) error {
 
 	// ── 2. Navy header (rounded top corners only) ─────────────────────────────
 	navyH := headerH - redStripH
-	drawRoundedRectTop(dc, 0, 0, float64(cardW), navyH+4, radius, colorNavy)
+	drawRoundedRectTop(dc, 0, 0, float64(cardW), navyH+4, radius, colorBgCard)
 
 	// Gold separator between navy and red
-	dc.SetColor(colorGold)
-	dc.DrawRectangle(0, navyH, float64(cardW), 4)
-	dc.Fill()
+	// dc.SetColor(colorGold)
+	// dc.DrawRectangle(0, navyH, float64(cardW), 4)
+	// dc.Fill()
 
 	// Red strip
 	dc.SetColor(colorRed)
@@ -92,10 +92,10 @@ func GenerateKTACard(data KTAData) error {
 	}
 
 	// ── 4. Header text in red strip ───────────────────────────────────────────
-	redCenterY := navyH + 4 + redStripH/2
+	redCenterY := navyH + 0 + redStripH/2
 
 	// "KARTU TANDA ANGGOTA" — spaced small text
-	loadFont(dc, fontRegular, 19)
+	loadFont(dc, fontBold, 19)
 	dc.SetColor(colorWhite)
 	drawTrackedText(dc, "KARTU TANDA ANGGOTA", float64(cardW)/2, redCenterY-20, 4)
 
@@ -111,14 +111,14 @@ func GenerateKTACard(data KTAData) error {
 
 	// Pre-calculate vertical positions so we can center the QR
 	numY := bodyTop + 72
-	div1Y := numY + 46
+	div1Y := numY + 36
 	labelY := div1Y + 30
-	nameY := labelY + 48
-	div2Y := nameY + 52
+	nameY := labelY + 60
+	div2Y := nameY + 68
 
 	// QR: right-aligned, vertically centered between div1 and div2
 	// Clamp to qrSize max so it never exceeds the constant
-	qrPad := 10.0
+	qrPad := -30.0
 	qrZoneH := div2Y - div1Y - qrPad*2
 	qrSize2 := qrZoneH
 	if qrSize2 > qrSize {
@@ -138,12 +138,12 @@ func GenerateKTACard(data KTAData) error {
 	}
 
 	// ── 6. Member number ──────────────────────────────────────────────────────
-	loadFont(dc, fontBold, 52)
+	loadFont(dc, fontBold, 48)
 	dc.SetColor(colorBlack)
 	dc.DrawStringAnchored(data.NomorKTA, contentX, numY, 0, 0.5)
 
 	// ── 7. Divider (full width) ───────────────────────────────────────────────
-	drawHLine(dc, contentX, rightEdge, div1Y, colorGold, 1.5)
+	// drawHLine(dc, contentX, rightEdge, div1Y, colorGold, 1.5)
 
 	// ── 8. NAMA ANGGOTA section ───────────────────────────────────────────────
 	drawSectionLabel(dc, "NAMA ANGGOTA", contentX, labelY)
@@ -157,10 +157,10 @@ func GenerateKTACard(data KTAData) error {
 	drawDashedLine(dc, contentX, nameY+24, textMaxX, nameY+24, colorGold)
 
 	// ── 9. Divider (full width) ───────────────────────────────────────────────
-	drawHLine(dc, contentX, rightEdge, div2Y, colorGold, 1.5)
+	// drawHLine(dc, contentX, rightEdge, div2Y, colorGold, 1.5)
 
 	// ── 10. WILAYAH section ───────────────────────────────────────────────────
-	wilayahLabelY := div2Y + 28
+	wilayahLabelY := div2Y + 14
 	drawSectionLabel(dc, "WILAYAH", contentX, wilayahLabelY)
 
 	loadFont(dc, fontRegular, 24)
@@ -320,10 +320,10 @@ func drawQRCode(dc *gg.Context, content string, x, y, size float64) error {
 
 	img, _, err := image.Decode(bytes.NewReader(pngBytes))
 	if err != nil {
-		dc.DrawImage(qr.Image(int(size)), int(x), int(y))
+		dc.DrawImage(qr.Image(int(size)), int(x), int(y-20))
 		return nil
 	}
-	dc.DrawImage(img, int(x), int(y))
+	dc.DrawImage(img, int(x), int(y-20))
 	return nil
 }
 
