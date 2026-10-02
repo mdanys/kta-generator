@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -9,19 +10,30 @@ import (
 	"math"
 	"os"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fogleman/gg"
+	"github.com/golang/freetype/truetype"
+	"github.com/redis/go-redis/v9"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
 // KTAData holds all the member data needed to render the card.
 type KTAData struct {
-	NomorKTA    string // 16-digit member number
-	NamaAnggota string // member name (empty = blank line for handwriting)
-	Kecamatan   string // e.g. "Kecamatan Kelapa Gading"
-	Kota        string // e.g. "KOTA JAKARTA UTARA"
-	Provinsi    string // e.g. "DKI Jakarta"
-	LogoPath    string // path to the Perindo eagle logo PNG
-	OutputPath  string // destination file path for the generated PNG
+	NomorKTA         string // 16-digit member number
+	NamaAnggota      string // member name (empty = blank line for handwriting)
+	Kecamatan        string // e.g. "Kecamatan Kelapa Gading"
+	Kota             string // e.g. "KOTA JAKARTA UTARA"
+	Provinsi         string // e.g. "DKI Jakarta"
+	LogoS3Bucket     string // S3 bucket containing the Perindo eagle logo PNG
+	LogoS3Key        string // S3 object key for the logo PNG
+	FontS3Bucket     string // S3 bucket containing the font files
+	FontRegularS3Key string // S3 object key for the regular font
+	FontBoldS3Key    string // S3 object key for the bold font
+	FontBlackS3Key   string // S3 object key for the heaviest font
+	FontItalicS3Key  string // S3 object key for the italic font
+	S3Bucket         string // destination S3 bucket
+	S3Key            string // destination object key
 }
 
 // Card dimensions — CR80 physical size at 300 dpi
@@ -34,8 +46,8 @@ const (
 	// Layout constants
 	marginL   = 64.0  // left margin for all body content
 	marginR   = 64.0  // right margin
-	headerH   = 220.0 // total header height (navy + red strip)
-	redStripH = 110.0  // height of the red portion of header
+	headerH   = 230.0 // total header height (navy + red strip)
+	redStripH = 120.0 // height of the red portion of header
 	qrSize    = 175.0 // QR code pixel size
 )
 
@@ -50,67 +62,67 @@ var (
 	colorBgCard = color.RGBA{R: 248, G: 248, B: 248, A: 255}
 )
 
-// font paths — falls back gracefully
-var (
-	fontRegular = "C:/Windows/Fonts/arial.ttf"
-	fontBold    = "C:/Windows/Fonts/arialbd.ttf"
-	fontItalic  = "C:/Windows/Fonts/ariali.ttf"
-)
+type cardFonts struct {
+	regular *truetype.Font
+	bold    *truetype.Font
+	black   *truetype.Font
+	italic  *truetype.Font
+}
 
-// GenerateKTACard renders a KTA Partai Perindo card and saves it as PNG.
-func GenerateKTACard(data KTAData) error {
+// GenerateKTACard renders a KTA Partai Perindo card and uploads it as PNG to S3.
+func GenerateKTACard(client *s3.Client, cache *redis.Client, data KTAData) error {
+	fonts, err := loadCardFonts(cache, client, data.FontS3Bucket, data.FontRegularS3Key, data.FontBoldS3Key, data.FontBlackS3Key, data.FontItalicS3Key)
+	if err != nil {
+		return err
+	}
+
 	dc := gg.NewContext(cardW, cardH)
 
 	// ── 1. White card background ──────────────────────────────────────────────
 	drawRoundedRect(dc, 0, 0, float64(cardW), float64(cardH), radius, colorBgCard)
 
-	// ── 2. Navy header (rounded top corners only) ─────────────────────────────
+	// ── 2. Navy header top (solid, rounded top corners) ──────────────────────
 	navyH := headerH - redStripH
-	drawRoundedRectTop(dc, 0, 0, float64(cardW), navyH+4, radius, colorBgCard)
+	// drawRoundedRectTop(dc, 0, 0, float64(cardW), navyH, radius, colorNavy)
 
-	// Gold separator between navy and red
-	// dc.SetColor(colorGold)
-	// dc.DrawRectangle(0, navyH, float64(cardW), 4)
-	// dc.Fill()
-
-	// Red strip
-	dc.SetColor(colorRed)
-	dc.DrawRectangle(0, navyH+4, float64(cardW), redStripH)
-	dc.Fill()
+	// ── 3. Red strip with left→right gradient (#232e6f → #bf2135) ────────────
+	gradLeft := color.RGBA{R: 0x23, G: 0x2e, B: 0x6f, A: 255}
+	gradRight := color.RGBA{R: 0xbf, G: 0x21, B: 0x35, A: 255}
+	drawHGradientRect(dc, 0, navyH, float64(cardW), redStripH, gradLeft, gradRight)
 
 	// Gold line at bottom of red strip
 	dc.SetColor(colorGold)
 	dc.DrawRectangle(0, headerH, float64(cardW), 4)
 	dc.Fill()
 
-	// ── 3. Logo centered in navy area ─────────────────────────────────────────
-	if data.LogoPath != "" {
+	// ── 4. Logo centered in navy area ─────────────────────────────────────────
+	if data.LogoS3Bucket != "" || data.LogoS3Key != "" {
 		logoY := navyH / 2
-		if err := drawLogo(dc, data.LogoPath, float64(cardW)/2, logoY, 140); err != nil {
+		if err := drawLogo(dc, cache, client, data.LogoS3Bucket, data.LogoS3Key, float64(cardW)/2, logoY, 140); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not load logo: %v\n", err)
 		}
 	}
 
-	// ── 4. Header text in red strip ───────────────────────────────────────────
-	redCenterY := navyH + 0 + redStripH/2
+	// ── 5. Header text in red strip ───────────────────────────────────────────
+	redCenterY := navyH + redStripH/2
 
 	// "KARTU TANDA ANGGOTA" — spaced small text
-	loadFont(dc, fontBold, 19)
+	loadFont(dc, fonts.bold, 19)
 	dc.SetColor(colorWhite)
-	drawTrackedText(dc, "KARTU TANDA ANGGOTA", float64(cardW)/2, redCenterY-20, 4)
+	drawTrackedText(dc, "KARTU TANDA ANGGOTA", float64(cardW)/2, redCenterY-22, 8)
 
 	// "PARTAI PERINDO" — bold large text
-	loadFont(dc, fontBold, 40)
+	loadFont(dc, fonts.black, 40)
 	dc.SetColor(colorWhite)
-	drawTrackedText(dc, "PARTAI PERINDO", float64(cardW)/2, redCenterY+22, 5)
+	drawTrackedText(dc, "PARTAI PERINDO", float64(cardW)/2, redCenterY+16, 5)
 
-	// ── 5. Body layout (below header) ─────────────────────────────────────────
-	bodyTop := headerH + 4 // just below gold line
+	// ── 6. Body layout (below header) ─────────────────────────────────────────
+	bodyTop := headerH // just below gold line
 	contentX := marginL
 	rightEdge := float64(cardW) - marginR
 
 	// Pre-calculate vertical positions so we can center the QR
-	numY := bodyTop + 72
+	numY := bodyTop + 64
 	div1Y := numY + 36
 	labelY := div1Y + 30
 	nameY := labelY + 60
@@ -138,7 +150,7 @@ func GenerateKTACard(data KTAData) error {
 	}
 
 	// ── 6. Member number ──────────────────────────────────────────────────────
-	loadFont(dc, fontBold, 48)
+	loadFont(dc, fonts.black, 48)
 	dc.SetColor(colorBlack)
 	dc.DrawStringAnchored(data.NomorKTA, contentX, numY, 0, 0.5)
 
@@ -146,10 +158,10 @@ func GenerateKTACard(data KTAData) error {
 	// drawHLine(dc, contentX, rightEdge, div1Y, colorGold, 1.5)
 
 	// ── 8. NAMA ANGGOTA section ───────────────────────────────────────────────
-	drawSectionLabel(dc, "NAMA ANGGOTA", contentX, labelY)
+	drawSectionLabel(dc, fonts, "NAMA ANGGOTA", contentX, labelY)
 
 	if data.NamaAnggota != "" {
-		loadFont(dc, fontItalic, 34)
+		loadFont(dc, fonts.italic, 34)
 		dc.SetColor(colorBlack)
 		dc.DrawStringAnchored(data.NamaAnggota, contentX, nameY, 0, 0.5)
 	}
@@ -161,36 +173,67 @@ func GenerateKTACard(data KTAData) error {
 
 	// ── 10. WILAYAH section ───────────────────────────────────────────────────
 	wilayahLabelY := div2Y + 14
-	drawSectionLabel(dc, "WILAYAH", contentX, wilayahLabelY)
+	drawSectionLabel(dc, fonts, "WILAYAH", contentX, wilayahLabelY)
 
-	loadFont(dc, fontRegular, 24)
+	loadFont(dc, fonts.regular, 24)
 	dc.SetColor(colorBlack)
 	dc.DrawStringAnchored(data.Kecamatan, contentX, wilayahLabelY+42, 0, 0.5)
 	dc.DrawStringAnchored(data.Kota+", "+data.Provinsi, contentX, wilayahLabelY+72, 0, 0.5)
 
 	// ── 11. Save with rounded clip ────────────────────────────────────────────
-	return saveWithRoundedClip(dc, data.OutputPath, radius)
+	return saveWithRoundedClip(dc, client, data.S3Bucket, data.S3Key, radius)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// loadFont tries the primary path, falls back to Verdana variants silently.
-func loadFont(dc *gg.Context, path string, size float64) {
-	if err := dc.LoadFontFace(path, size); err != nil {
-		switch path {
-		case fontBold:
-			dc.LoadFontFace("C:/Windows/Fonts/verdanab.ttf", size) //nolint
-		case fontItalic:
-			dc.LoadFontFace("C:/Windows/Fonts/verdanai.ttf", size) //nolint
-		default:
-			dc.LoadFontFace("C:/Windows/Fonts/verdana.ttf", size) //nolint
-		}
+func loadCardFonts(cache *redis.Client, client *s3.Client, bucket, regularKey, boldKey, blackKey, italicKey string) (cardFonts, error) {
+	if bucket == "" {
+		return cardFonts{}, fmt.Errorf("font S3 bucket is required")
 	}
+
+	regular, err := loadFontFromS3(cache, client, bucket, regularKey)
+	if err != nil {
+		return cardFonts{}, fmt.Errorf("load regular font: %w", err)
+	}
+	bold, err := loadFontFromS3(cache, client, bucket, boldKey)
+	if err != nil {
+		return cardFonts{}, fmt.Errorf("load bold font: %w", err)
+	}
+	black, err := loadFontFromS3(cache, client, bucket, blackKey)
+	if err != nil {
+		return cardFonts{}, fmt.Errorf("load black font: %w", err)
+	}
+	italic, err := loadFontFromS3(cache, client, bucket, italicKey)
+	if err != nil {
+		return cardFonts{}, fmt.Errorf("load italic font: %w", err)
+	}
+
+	return cardFonts{regular: regular, bold: bold, black: black, italic: italic}, nil
+}
+
+func loadFontFromS3(cache *redis.Client, client *s3.Client, bucket, key string) (*truetype.Font, error) {
+	if key == "" {
+		return nil, fmt.Errorf("font S3 key is required")
+	}
+	fontData, err := loadS3Asset(context.Background(), cache, client, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	font, err := truetype.Parse(fontData)
+	if err != nil {
+		return nil, fmt.Errorf("parse s3://%s/%s: %w", bucket, key, err)
+	}
+	return font, nil
+}
+
+func loadFont(dc *gg.Context, font *truetype.Font, size float64) {
+	face := truetype.NewFace(font, &truetype.Options{Size: size})
+	dc.SetFontFace(face)
 }
 
 // drawSectionLabel draws a small all-caps tracked label in gray.
-func drawSectionLabel(dc *gg.Context, text string, x, y float64) {
-	loadFont(dc, fontRegular, 17)
+func drawSectionLabel(dc *gg.Context, fonts cardFonts, text string, x, y float64) {
+	loadFont(dc, fonts.regular, 17)
 	dc.SetColor(colorGray)
 	// left-aligned tracked text
 	drawTrackedTextLeft(dc, text, x, y, 3)
@@ -276,17 +319,18 @@ func drawDashedLine(dc *gg.Context, x1, y1, x2, y2 float64, c color.Color) {
 	}
 }
 
-// drawLogo loads a PNG logo and draws it centered at (cx, cy), scaled to maxW.
-func drawLogo(dc *gg.Context, path string, cx, cy, maxW float64) error {
-	f, err := os.Open(path)
+// drawLogo downloads a PNG logo from S3 and draws it centered at (cx, cy), scaled to maxW.
+func drawLogo(dc *gg.Context, cache *redis.Client, client *s3.Client, bucket, key string, cx, cy, maxW float64) error {
+	if bucket == "" || key == "" {
+		return fmt.Errorf("logo S3 bucket and key are required")
+	}
+	logoData, err := loadS3Asset(context.Background(), cache, client, bucket, key)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	img, err := png.Decode(f)
+	img, err := png.Decode(bytes.NewReader(logoData))
 	if err != nil {
-		return err
+		return fmt.Errorf("decode logo s3://%s/%s: %w", bucket, key, err)
 	}
 
 	b := img.Bounds()
@@ -327,8 +371,15 @@ func drawQRCode(dc *gg.Context, content string, x, y, size float64) error {
 	return nil
 }
 
-// saveWithRoundedClip clips the context to rounded corners and saves as PNG.
-func saveWithRoundedClip(dc *gg.Context, outputPath string, r float64) error {
+// saveWithRoundedClip clips the context to rounded corners and uploads it as PNG to S3.
+func saveWithRoundedClip(dc *gg.Context, client *s3.Client, bucket, key string, r float64) error {
+	if bucket == "" {
+		return fmt.Errorf("S3 bucket is required")
+	}
+	if key == "" {
+		return fmt.Errorf("S3 object key is required")
+	}
+
 	w := float64(dc.Width())
 	h := float64(dc.Height())
 
@@ -337,11 +388,33 @@ func saveWithRoundedClip(dc *gg.Context, outputPath string, r float64) error {
 	final.Clip()
 	final.DrawImage(dc.Image(), 0, 0)
 
-	f, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("create output file: %w", err)
+	var imageData bytes.Buffer
+	if err := png.Encode(&imageData, final.Image()); err != nil {
+		return fmt.Errorf("encode PNG: %w", err)
 	}
-	defer f.Close()
 
-	return png.Encode(f, final.Image())
+	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(imageData.Bytes()),
+		ContentType: aws.String("image/png"),
+	})
+	if err != nil {
+		return fmt.Errorf("upload PNG to s3://%s/%s: %w", bucket, key, err)
+	}
+	return nil
+}
+
+// drawHGradientRect fills a rectangle with a horizontal linear gradient,
+// lerping from colorL on the left to colorR on the right.
+func drawHGradientRect(dc *gg.Context, x, y, w, h float64, colorL, colorR color.RGBA) {
+	for col := 0; col < int(w); col++ {
+		t := float64(col) / float64(int(w)-1)
+		cr := uint8(float64(colorL.R) + t*(float64(colorR.R)-float64(colorL.R)))
+		cg := uint8(float64(colorL.G) + t*(float64(colorR.G)-float64(colorL.G)))
+		cb := uint8(float64(colorL.B) + t*(float64(colorR.B)-float64(colorL.B)))
+		dc.SetColor(color.RGBA{R: cr, G: cg, B: cb, A: 255})
+		dc.DrawRectangle(x+float64(col), y, 1, h)
+		dc.Fill()
+	}
 }
